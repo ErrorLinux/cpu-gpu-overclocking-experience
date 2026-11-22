@@ -1,0 +1,6 @@
+*.img
+*.dtb
+*.dts
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,80 @@
+Cara Overclock GPU Unisoc GUIDE by @KurumiDev2
+
+Alat:
+Laptop/Pc yang sudah di pasang operating system ubuntu atau distro linux lainnya
+
+Bahan:
+Vendor_boot.img bisa ambil dari firmware
+Tools Unpac Repac .img: https://drive.google.com/file/d/1Ia4Y8OcGSeCc0nrrnZ_rihtaXzxoPekE/view?usp=drivesdk
+
+Proses Overclock:
+1. Buat folder baru
+2. Extrak tools unpac repac yang udah di download
+3. Pindahkan semua bahan ke folder yg sudah di buat
+4. Jalankan perintah ini
+   1. ./magiskboot unpack vendor_boot.img
+   2. hexdump -v -e '/1 "%02x "' dtb | grep -b -o "d0 0d fe ed"
+      kalau keluar angka ini 192:d0 0d fe ed lanjutkan saja jika tidak ada atau angka nya beda silahkan tanya AI ini script saya dapat dari AI Gemini
+   3. dd if=dtb of=clean.dtb bs=1 skip=64
+   4. ./dtc -I dtb -O dts -o modified_dt.dts clean.dtb
+      disini kalian buka file modified_dt.dts nya dan cari teks ini:
+      gpu@23100000 {
+                compatible = "sprd,mali-natt";
+                reg = <0x00 0x23100000 0x00 0x100000>;
+                gpu-supply = <0x47>;
+                system-coherency = <0x1f>;
+                topdvfs-controller = <0x48>;
+                sprd,gpu-apb-syscon = <0x49>;
+                sprd,gpu-dvfs-apb-syscon = <0x4a>;
+                top_dvfs_cfg = <0x4b 0x150 0x02>;
+                top-force-shutdown = <0x11 0x2c4 0x2000000>;
+                gpu_core0_state = <0x11 0x500 0x1f000000>;
+                cur_st_st0 = <0x49 0x2c 0xf0>;
+                gpu_top_state = <0x11 0x500 0x1f0000>;
+                interrupts = <0x00 0x3c 0x04 0x00 0x3c 0x04 0x00 0x3c 0x04>;
+                interrupt-names = "JOB\0MMU\0GPU";
+                nvmem-cells = <0x4c>;
+                nvmem-cell-names = "gpu_bin";
+                operating-points = <0x5dc00 0xaae60 0x7d000 0xb71b0 0x96000 0xb71b0 0xbb800 0xc3500 0xcf850 0xc3500>;
+                sprd,dvfs-lists = <0x5dc00 0xaae60 0x04 0x01 0x7d000 0xb71b0 0x05 0x01 0x96000 0xb71b0 0x06 0x01 0xbb800 0xc3500 0x07 0x01 0xcf850 0xc3500 0x08 0x01>;
+                sprd,dvfs-default = <0x00>;
+                sprd,dvfs-scene-extreme = <0x03>;
+                sprd,dvfs-scene-high = <0x02>;
+                sprd,dvfs-scene-medium = <0x01>;
+                sprd,dvfs-scene-low = <0x00>;
+                sprd,dvfs-range-max = <0x04>;
+                sprd,dvfs-range-min = <0x00>;
+                #cooling-cells = <0x02>;
+                dynamic-power-coefficient = <0x4d>;
+                clocks = <0x35 0x09 0x4d 0x00 0x4d 0x02 0x4d 0x04 0x27 0x02 0x27 0x08 0x27 0x16 0x27 0x01 0x27 0x1d>;
+                phandle = <0xbf>;
+            };
+        };
+        kalian ubah nilai dari bagian ini aja:
+        operating-points = <0x5dc00 0xaae60 0x7d000 0xb71b0 0x96000 0xb71b0 0xbb800 0xc3500 0xcf850 0xc3500>;
+        sprd,dvfs-lists = <0x5dc00 0xaae60 0x04 0x01 0x7d000 0xb71b0 0x05 0x01 0x96000 0xb71b0 0x06 0x01 0xbb800 0xc3500 0x07 0x01 0xcf850 0xc3500 0x08 0x01>;        
+        sprd,dvfs-scene-extreme = <0x03>;
+        sprd,dvfs-scene-high = <0x02>;
+        sprd,dvfs-scene-medium = <0x01>;
+        sprd,dvfs-range-max = <0x04>;
+        
+        Cara ubah bisa tanya Gemini AI pasti tau dia soalnya ini bahasa Hex we gk bisa jelasin bahasa hex ini gw dari AI sekali lagi dari AI we cuman ngasih panduan unpac repac dan apa aja
+        yg di ubah untuk cara ubah nya masukin nilai nya dll maaf banget gk bisa kasih tau karena we sendiri nanya AI :)
+
+       Anggap aja udah di ubah lah ya sama kalian tinggal lanjut repac jadi vendor_boot.img nya lagi jalanin ini:
+  5. ./dtc -I dts -O dtb -o dtb_mod modified_dt.dts
+  6. dd if=dtb count=64 bs=1 > header.bin
+  7. cat header.bin dtb_mod > dtb_final
+  8. ./magiskboot repack vendor_boot.img
+  9. Jika udah maka akan muncul file baru namanya new-boot.img tinggal flash aja new-boot.img di fastboot
+
+
+Cara Flash Hasil Overclock GPU Unisoc:
+1. Masuk fastboot pakai adb reboot fastboot
+2. Flash new-boot.img pakai command ini fastboot flash vendor_boot [ tarik file new-boot.img ke cmd ubuntu/distro linux kalian ]
+3. Tinggal kalian reboot system jika sudah di flash cara nya ketik fastboot reboot
+4. Udah gitu doang kalau boot tinggal check frekuensi gpu kalian udah ke ubah/belum jika bootloop/stuck/hitam doang tinggal flash vendor_boot sebelum di unpac alias vendor_boot firmware
+5. Sekian terima kasih :)
+
+script GUIDE by: @KurumiDev2
+script perintah overclock by: Gemini AI

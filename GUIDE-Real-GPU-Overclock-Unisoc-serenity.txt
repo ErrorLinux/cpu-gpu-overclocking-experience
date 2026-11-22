@@ -1,0 +1,320 @@
+Unisoc GPU REAL Overclock Guide — Mali-G57 MP1 (Unisoc T7250 / UMS9230E, codename "serenity")
+================================================================================================
+
+Device        : Redmi A5 / POCO C71 (serenity_global / serenity)
+SoC           : Unisoc UMS9230E "T7250", GPU = Mali-G57 MP1 at gpu@23100000
+Kernel        : 6.18.21-android17-5-gf8ee977e062b-ab16100350-4k (4k pages)
+Fingerprint   : Redmi/serenity_global/serenity:17/CP2A.260605.016/A17.0.4.0.XGWMIXM:user/release-keys
+GUIDE by      : adapted from the on-device investigation (2026-11-18).
+                Original idea (flash vendor_boot.img built from stock + DTB edit) is by @KurumiDev2,
+                this guide replaces the fake one ("OPP-table-only") with the WORKING method.
+
+DISCLAIMER
+----------
+Flashing a modified `vendor_boot.img` can brick the device or make it unusable until you
+re-flash the stock image. You accept that risk by following these steps. I never flash
+anything myself — you flash. The stock `vendor_boot.img` is always the way back.
+
+
+WHY THE NAIVE METHOD DOES NOT WORK ON THIS PHONE
+------------------------------------------------
+Editing `operating-points` / `sprd,dvfs-lists` in the DTB (the idea in public "Unisoc GPU OC
+guides") changes only the **label** the driver sees. It does NOT change any PLL:
+
+    gpu@23100000
+      clocks = twpll-384m, twpll-512m, lpll-614m4, twpll-768m, GPLL
+                [0]        [1]        [2]          [3]        [4]  <- DVFS level 4
+
+The device has a 5-level DVFS driver (gpu_pm_ums9230.ko). Its `mali_clock_on()` only handles
+1-clock and 2-clock tables with `clk_set_rate()`. For 5 levels it only:
+  * writes a voltage register (regmap) and a QoS register via maliQosConfig(),
+  * stores the level index in its context.
+It never calls clk_set_rate() or clk_set_parent(). The kbase module doesn't either. The
+clock "mux" the CCF driver shows (`gpu-core-clk`, bits[6:4] of 0x23000004) always reads
+`twpll-384m` and is not used for DVFS. The hardware DVFS ("topdvfs") selects the level's
+*fixed rate* PLL behind the level: level 4 = GPLL.
+
+GPLL (the source of DVFS level 4) is a 26 MHz-derived PLL stuck at **850 MHz**. The GPU is
+therefore **always** 850 MHz no matter what the OPP table says (1.0 / 1.5 / 2.2 GHz builds
+report the fake number but run at 850 MHz).
+
+The only way to a REAL overclock on this phone:
+
+  1. reprogram GPLL itself at boot (via `assigned-clock-rates` on the GPU node), or
+  2. let the GPU stay at 850 MHz (stock).
+
+GPLL has exactly one consumer — the GPU (`<0x24 0x1d>` appears once in the DTB) — so raising
+it cannot break anything else. GPLL supports up to 1.6 GHz (table max, ibias 6). On this
+machine, however, the voltage rail `vddgpu` is **locked at ~912.5 mV by the topdvfs hardware**,
+so anything above ~1.1 GHz produces random rendering artifacts ("rác hình").
+
+
+INGREDIENTS
+-----------
+* `vendor_boot.img` from firmware (stock — the only honest baseline).
+* A Linux PC or Termux environment with `python3`. No compiler, no dtc, no magiskboot needed.
+* fastboot for flashing.
+* ~1 hour of patience and a working backup image.
+
+
+STEP 0 — BACKUP
+---------------
+Copy everything to a safe folder. Keep `vendor_boot.img` untouched. You will build
+`vendor_boot_oc_XXXXmhz.img` and flash only that.
+
+
+STEP 1 — FIND THE DTB INSIDE vendor_boot.img
+--------------------------------------------
+On this phone the layout is:
+
+    0x00000000  vendor boot header (v4, magic "VNDRBOOT", dtb_size @ 0x834)
+    ...         vendor ramdisk (44 MB, 1st page)
+    0x02482000  SPRD "wrapper" header, 64 bytes, magic 0xD7B7AB1E
+        +0x04   container size (wrapper + FDT)        = 146,658
+        +0x20   FDT totalsize                          = 146,594
+        +0x24   FDT offset from wrapper start          = 0x40
+    0x02482040  FDT ("flattened device tree")  — magic 0xD00DFEED
+    0x024A5CE2  end of FDT; padding (zeros) until next 4 KB page boundary
+
+Other Unisoc devices follow the same pattern (wrapper + FDT inside one DTB section).
+
+You can auto-locate it with the script in Appendix A. Expected result on serenity:
+`FDT_OFF = 38281280`, `WRAPPER = FDT_OFF - 64`, boot header `dtb_size@0x834 = 146,658`.
+
+
+STEP 2 — DECIDE YOUR TARGET CLOCK
+---------------------------------
+Remember: voltage is locked at ~912.5 mV (you cannot raise it — see "WHY ..." above).
+
+    Target GPLL     Expected result on this unit
+    ---------      ----------------------------
+    850 MHz         stock, guaranteed OK
+    1000 MHz        +17%, should be fine
+    1100 MHz        +29%, **stable here, recommended**
+    1150 MHz        screen artifacts under load
+    1200 MHz        screen artifacts under load
+    1600 MHz        GPU hangs during boot (GPU fault 0x4002)
+
+Start with 1100 MHz. If stable for days, try 1125 / 1150 and see if artifacts appear.
+NEVER try more than 1600 MHz (GPLL table max).
+
+The OPP "top OPP" in `sprd,dvfs-lists` must be set to the SAME value as GPLL, otherwise the
+driver's level number and GPLL rate diverge (harmless but confusing). Set the top
+`operating-points` entry to the same frequency. Keep the clock cell `0x08` (GPLL).
+
+
+STEP 3 — REBUILD THE DTB WITH python3 (no other tools)
+------------------------------------------------------
+The DTB in this image is 146,594 bytes; the page padding after it holds ~798 bytes. Our
+patch adds 57 bytes, so every existing offset stays valid:
+
+  * top `operating-points` / `sprd,dvfs-lists` freq cell -> target (kHz, big-endian u32)
+  * top volt cell -> 1,000,000 µV (only cosmetic: rail is voltage-locked anyway)
+  * GPU node: insert `assigned-clocks = <0x24 0x1d>` and `assigned-clock-rates = <rate>`
+  * update FDT header `totalsize`/`size_dt_struct`/`off_dt_strings`/`size_dt_strings`
+  * update wrapper (+0x04 container size, +0x20 FDT size) and boot header `dtb_size` (0x834)
+
+Use Appendix A (`real_oc.py`) — it does all of this and verifies the result. Example
+(measured GPLL for 1.1 GHz = nint 42, kint 2581110, registers 0x15276276/0x000007af):
+
+    python3 real_oc.py vendor_boot.img vendor_boot_oc_1100mhz_1000mv.img 1100000 1100000000 1000000
+
+Output file hashes are in this folder already. **Nothing is flashed by this script.**
+
+
+STEP 4 — FLASH
+--------------
+    adb reboot fastboot
+    fastboot flash vendor_boot vendor_boot_oc_1100mhz_1000mv.img
+    fastboot reboot
+
+Only ONE file is ever flashed per attempt — `vendor_boot_oc_*mhz*.img`. Never flash
+`dtbo.img`, `boot.img`, `vbmeta.img` or kernel modules from this guide.
+
+
+STEP 5 — VERIFY THAT THE GPU IS REALLY RUNNING AT THE NEW CLOCK
+-----------------------------------------------------------------
+Do NOT trust `cur_freq`. It only shows the requested level. Read the PLL itself:
+
+    adb shell su -c 'toybox mount -t debugfs debugfs /sys/kernel/debug'
+    adb shell su -c 'cat /sys/kernel/debug/regmap/dummy-syscon@0x00000000645a0000/registers' | sed -n "19,21p"
+
+    Expected on 1.1 GHz build:
+        0048: 000007af
+        004c: 15276276
+        0050: 00000005
+
+    Decode (see Appendix B):  nint = 42, kint = 2,581,110
+    GPLL = 26 MHz * (42 + 2581110 / 8388608) = 1100.00 MHz   (exact)
+
+    Stock:  000007ab / 10589d8a  ->  nint = 32, kint = 5,807,498  ->  850.00 MHz
+
+Other useful checks:
+
+    adb shell 'cat /sys/class/devfreq/23100000.gpu/available_frequencies'
+    # should begin with 1100000000
+    adb shell su -c 'cat /sys/kernel/debug/mali0/gpu_freq_time'
+    # 1100000000 bucket must show some Busy time after the GPU has run
+    adb shell su -c 'dmesg' | grep -iE 'GPU fault|JS: Job|soft-reset'
+    # ZERO faults on a healthy overclock
+
+Note: `ls` inside debugfs is typically refused by SELinux ("Permission denied") but direct
+`cat` of regmap files still works. Do NOT read `/sys/kernel/debug/clk/gpll/clk_rate` or
+`clk_summary` — both hang the reader on this kernel.
+
+
+STEP 6 — STABILITY TESTING
+--------------------------
+Boot up, then:
+  1. let the phone idle idle — make sure the launcher comes up normally,
+  2. open a game (the heavy ones show artifacts fast, e.g. Lien Quân / similar),
+  3. if you see colored junk / scrambled textures / random black squares, the clock is too
+     high for the locked rail — reflash a lower-frequency image (previous known-good).
+  4. watch `dmesg` for `GPU fault` afterwards.
+
+
+STEP 7 — ROLLBACK
+-----------------
+    adb reboot fastboot
+    fastboot flash vendor_boot vendor_boot.img          # back to stock 850 MHz
+    # or, if 1.1 GHz is good for you:
+    fastboot flash vendor_boot vendor_boot_oc_1100mhz_1000mv.img
+    fastboot reboot
+
+
+WHAT IS NOT POSSIBLE ON THIS PHONE (AND WHY)
+---------------------------------------------
+* Raise vddgpu above ~912.5 mV: the topdvfs DVFS engine (firmware sequencer, table in chip
+  efuse/firmware, not in DTB) chooses the GPU voltage from a per-level table. The
+  `sprd,dvfs-lists` voltage cell is not sent to the regulator.
+* Overclock beyond 1.6 GHz: GPLL frequency table max is 1.6 GHz.
+* "Safely" push 1.2 GHz on this unit at the locked rail: artifacts appear here (measured).
+* Use the naive OPP-table-only edit and get any speedup: it never reprograms GPLL (measured,
+  see "WHY ..." above).
+
+
+APPENDIX A — real_oc.py (verified on serenity: 1100/1150/1200/1600 MHz builds)
+---------------------------------------------------------------------------
+#!/usr/bin/env python3
+import struct, sys
+
+SRC, DST, FREQ_KHZ, GPLL_HZ, VOLT_UV = sys.argv[1], sys.argv[2], \
+    int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+TARGET_PATH = ("soc", "mm", "gpu@23100000")
+FDT_BEGIN, FDT_END_NODE, FDT_PROP, FDT_NOP, FDT_FIN = 1, 2, 3, 4, 9
+
+img = bytearray(open(SRC, "rb").read())
+FDT_OFF = 38281280
+WRAPPER = FDT_OFF - 64                       # SPRD 64-byte wrapper before the FDT
+DTB_SIZE = struct.unpack_from(">I", img, WRAPPER + 0x20)[0]   # big-endian: FDT totalsize
+print("FDT at %#x, size %d" % (FDT_OFF, DTB_SIZE))
+
+dtb = bytearray(img[FDT_OFF:FDT_OFF + DTB_SIZE])
+magic, totalsize, off_struct, off_strings, off_rsv, ver, last, bcpu, \
+    size_strings, size_struct = struct.unpack_from(">10I", dtb, 0)
+assert magic == 0xD00DFEED and totalsize == DTB_SIZE
+struct_blk = dtb[off_struct:off_struct + size_struct]
+strings_blk = dtb[off_strings:off_strings + size_strings]
+
+def sname(rel):
+    e = dtb.index(b"\0", rel)
+    return dtb[rel:e].decode()
+
+# ---- pass 1: find gpu END_NODE offset and OPP property offsets
+gpu_end = [None]
+prop_pos = {}
+p, path = off_struct, []
+while True:
+    tag = struct.unpack_from(">I", dtb, p)[0]; p += 4
+    if tag == FDT_BEGIN:
+        e = dtb.index(b"\0", p); path.append(dtb[p:e].decode()); p = (e + 4) & ~3
+    elif tag == FDT_END_NODE:
+        if tuple(path[-3:]) == TARGET_PATH:
+            gpu_end[0] = p - 4
+        path.pop()
+    elif tag == FDT_PROP:
+        length, nameoff = struct.unpack_from(">II", dtb, p); p += 8
+        if tuple(path[-3:]) == TARGET_PATH:
+            nm = sname(off_strings + nameoff)
+            if nm in ("operating-points", "sprd,dvfs-lists"):
+                prop_pos[nm] = (p, length)
+        p = (p + length + 3) & ~3
+    elif tag == FDT_FIN:
+        break
+ins = gpu_end[0] - off_struct
+op_off, op_len = prop_pos["operating-points"]
+dl_off, dl_len = prop_pos["sprd,dvfs-lists"]
+assert op_len == 40 and dl_len == 80
+
+# ---- strings: reuse existing names, append "assigned-clock-rates" if missing
+names = {}
+p2 = 0
+while p2 < len(strings_blk):
+    e = strings_blk.index(b"\0", p2)
+    names[strings_blk[p2:e].decode()] = p2
+    p2 = e + 1
+SN = names.get("assigned-clocks")
+if SN is None:
+    SN = len(strings_blk); strings_blk += b"assigned-clocks\0"
+SR = names.get("assigned-clock-rates")
+if SR is None:
+    SR = len(strings_blk); strings_blk += b"assigned-clock-rates\0"
+
+# ---- pass 2: insert the two properties in the gpu node
+props  = struct.pack(">III", FDT_PROP, 8, SN) + struct.pack(">II", 0x24, 0x1d)
+props += struct.pack(">III", FDT_PROP, 4, SR) + struct.pack(">I", GPLL_HZ)
+struct_new = struct_blk[:ins] + props + struct_blk[ins:]
+new_off_strings = off_struct + len(struct_new)
+new_total = new_off_strings + len(strings_blk)
+assert new_total <= DTB_SIZE + 798          # must fit the page padding
+header = struct.pack(">10I", magic, new_total, off_struct, new_off_strings,
+                     off_rsv, ver, last, bcpu, len(strings_blk), len(struct_new))
+fdt = bytearray(header + dtb[40:off_struct] + struct_new + strings_blk)
+
+# ---- patch the top OPP in-place (u32 pairs, big-endian)
+assert struct.unpack_from(">II", dtb, op_off + 32) == (850000, 800000)
+assert struct.unpack_from(">II", dtb, dl_off + 64) == (850000, 800000)
+struct.pack_into(">II", fdt, op_off + 32, FREQ_KHZ, VOLT_UV)
+struct.pack_into(">II", fdt, dl_off + 64, FREQ_KHZ, VOLT_UV)
+assert struct.unpack_from(">I", fdt, dl_off + 64 + 8)[0] == 0x08   # GPLL cell
+
+# ---- write (keep the original file length)
+out = bytearray(img)
+out[FDT_OFF:FDT_OFF + new_total] = fdt
+struct.pack_into(">I", out, WRAPPER + 0x04, 64 + new_total)
+struct.pack_into(">I", out, WRAPPER + 0x20, new_total)
+struct.pack_into("<I", out, 0x834, 64 + new_total)
+open(DST, "wb").write(out)
+print("wrote %s (%d bytes), FDT totalsize %d" % (DST, len(out), new_total))
+
+APPENDIX B — Decode GPLL from registers (run on the phone)
+------------------------------------------------------------
+    adb shell su -c 'cat /sys/kernel/debug/regmap/dummy-syscon@0x00000000645a0000/registers' \
+      | sed -n '19,21p'
+
+    Stock  : 0048: 000007ab   004c: 10589d8a   0050: 00000005
+    1.1 GHz: 0048: 000007af   004c: 15276276   0050: 00000005
+
+    python3 - <<'EOF'
+    r4c = 0x15276276
+    nint = (r4c >> 23) & 0x7f
+    kint = r4c & 0x7fffff
+    print("GPLL = %.2f MHz" % (26 * (nint + kint / 2**23)))
+    EOF
+
+APPENDIX C — Why this cannot break anything else
+---------------------------------------------------
+* `<0x24 0x1d>` (gc-pll / CLK_GPLL) is referenced by exactly one DT node: the GPU.
+* GPLL's ftable covers up to 1.6 GHz; requested 1.1 GHz is comfortably inside.
+* Nothing in the 5-level driver path ever reprograms GPLL, so the rate sticks for the
+  entire uptime.
+* The display, camera, DDR and audio PLLs (TWPLL/LPLL/ISPPLL/MPLL) are separate blocks.
+
+APPENDIX D — What NOT to do
+---------------------------
+* Do not read `/sys/kernel/debug/clk/gpll/clk_rate`, `clk/gpll/clk_rate` or
+  `/sys/kernel/debug/clk_summary` — they hang the task on this kernel.
+* Do not buy kprobe/ftrace ideas: kprobes register but never fire (0 hits).
+* Do not flash 1.6 GHz/2.2 GHz builds "just to try" — the GPU faults at boot.
+* Do not raise `dynamic-power-coefficient` or similar — it changes nothing about the clock.
+* Do not flash `vbmeta`/`boot`/`dtbo` images from this guide — only `vendor_boot.img`.

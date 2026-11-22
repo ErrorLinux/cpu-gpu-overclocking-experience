@@ -1,0 +1,80 @@
+ALL-FREQS GPU EXPERIMENT — build notes
+======================================
+
+Base image : vendor_boot.img (SHA-256 fc38cbb7f...) — Redmi A5 kernel 5.15
+             build (FDT at 0x20b9040, wrapper at FDT-0x40, v4 image).
+Builder    : build_allfreq.py (dtc decompile -> edit GPU node -> dtc
+             recompile -> byte-level reassemble; NO mkbootimg repack).
+
+Each image adds these GPU OPP levels (kHz / uV) and sets sprd,dvfs-range-max
+/ sprd,dvfs-scene-extreme to 0x0a:
+
+  level  freq(MHz)  volt(mV)  cell
+  0      384.0      700       0x04 (twpll-384m)
+  1      512.0      750       0x05 (twpll-512m)
+  2      614.4      750       0x06 (lpll-614m4)
+  3      768.0      800       0x07 (twpll-768m)
+  4      1000.0     900       0x08 (GPLL)
+  5      1100.0     950       0x08 (GPLL)
+  6      1200.0     975       0x08 (GPLL)
+  7      1300.0     1000      0x08 (GPLL)
+  8      1400.0     1025      0x08 (GPLL)
+  9      1500.0     1050      0x08 (GPLL)
+  10     1600.0     1100      0x08 (GPLL)
+
+assigned-clocks = <0x2a 0x1d> (GPLL) is added to the GPU node, with
+assigned-clock-rates = the image's rate. ONE rate per image:
+
+  vendor_boot_allfreq_1000mhz.img  GPLL 1000 MHz  sha256 283e7ab0e45ec6885848e29a76d9b91e9ac58eb0b4a0ccc858776e8e670571d4
+  vendor_boot_allfreq_1100mhz.img  GPLL 1100 MHz  sha256 4be9f3843a2e984f21b20429dc8c58177cbe162ac7d448d2d2794805a43ee948
+  vendor_boot_allfreq_1200mhz.img  GPLL 1200 MHz  sha256 c3f8a3964763d17ee7bbc2670304ae3ef314a0c76b532a2dbf17f2957fe7f8b7
+  vendor_boot_allfreq_1300mhz.img  GPLL 1300 MHz  sha256 ddef44458a51f21166ceb3e8d48ae096e50269798dac5eb69752efebffd9fdce
+  vendor_boot_allfreq_1400mhz.img  GPLL 1400 MHz  sha256 6c852e1af972bcb3efea951297c9e57fd49b776f2ee05e8943bb7d1114d156d9
+  vendor_boot_allfreq_1500mhz.img  GPLL 1500 MHz  sha256 b8ad2981e12e674515dfc36a714d3e822f5de60f9be5319eec7dab8f47cd070b
+  vendor_boot_allfreq_1600mhz.img  GPLL 1600 MHz  sha256 fdc45036918cc6599fba670034225ff52fc56edae54b9eb8f06b72fe07ce10c7
+
+Verification: every image is 104,857,600 bytes; FDT magic, wrapper
++0x04/+0x20 and header 0x834 match the rebuilt FDT; bytes outside the FDT
+and the tail after the FDT are byte-identical to the base (only 0x834,
+wrapper +0x04/+0x20 differ). GPU node re-parsed after build.
+
+WARNINGS
+--------
+1. The base is a kernel 5.15 vendor_boot for the SAME device. It must be
+   flashed together with the matching 5.15 kernel (and its ramdisk). Do
+   NOT flash it onto Android 17 / kernel 6.18 firmware.
+2. devfreq will list all 11 levels (1000...1600 included), but GPLL is a
+   SINGLE fixed rate per image. Selecting 1.6 GHz in sysfs does NOT
+   reprogram GPLL to 1.6 GHz unless you flashed the 1600mhz image.
+3. The GPU rail (DCDC_GPU) is clamped by topdvfs (~750/781/912 mV). The
+   voltage column above is cosmetic; raising it does not raise the rail.
+4. Measured on this hardware: <= 1.1 GHz stable, 1.15/1.2 GHz artifacts,
+   1.6 GHz hangs at boot (GPU fault 0x4002). The 5.15 base may behave the
+   same; test at your own risk and keep the stock image for rollback.
+5. OPP table entries are only labels unless assigned-clocks reprograms GPLL.
+6. Do not flash these on top of SML/SPL changes you do not understand.
+
+================================================================================
+REAL OC IMAGES (assigned-clocks reprograms GPLL, 5 OPP levels)
+================================================================================
+Built with build_real_oc.py. These mirror Ainz-GPU-OC-Kit/oc.py: the top OPP is
+rewritten to the chosen rate, assigned-clocks programs GPLL once at boot.
+GPU node verified after each build (assigned-clock-rates matches the rate).
+
+  vendor_boot_oc_1000mhz_1000mv.img  GPLL 1000 MHz  sha256 ab7a230422105ec9b688a55ad71b25ac9625fbe9699432f3fa001c979aadde21
+  vendor_boot_oc_1100mhz_1000mv.img  GPLL 1100 MHz  sha256 92b336f919f7d8106ce3a2fefeabd6e3d35ae65c413aa434d973bd4fcea068a0
+  vendor_boot_oc_1200mhz_1000mv.img  GPLL 1200 MHz  sha256 7bcd3154f5051f089994f840c93a7d7d21a6dadf4ce8dafad01b5c0def6651ff
+  vendor_boot_oc_1300mhz_1000mv.img  GPLL 1300 MHz  sha256 1f96b9d069ca20ab787fb5f44e81ed6dc85226ef32a88b2d9fc183ec89900846
+  vendor_boot_oc_1400mhz_1000mv.img  GPLL 1400 MHz  sha256 18e2dd3a099fda2f01481a13752d697710c5d867c88ee4bb73a596e7c37bda22
+  vendor_boot_oc_1500mhz_1000mv.img  GPLL 1500 MHz  sha256 051f276f86abe0acb30d43e7e33a5d6bc6ad7398b92853312d6f0b7622101e01
+  vendor_boot_oc_1600mhz_1000mv.img  GPLL 1600 MHz  sha256 9aa72e63eed7a2c6955b88545a714457abf9c7deb31243b96d458bdabcb97263
+
+ALL of the above keep 5 OPP levels (384/512/614.4/768/<rate>), range-max=0x04,
+scene-extreme=0x03. Only the top OPP + assigned-clock-rates change. The rail is
+still clamped by topdvfs (~912 mV at 1.1 GHz), so > 1.1 GHz is experimental
+and 1.6 GHz is expected to hang at boot (GPU fault 0x4002).
+
+Flash (your own action, never automated):
+  fastboot flash vendor_boot vendor_boot_oc_1100mhz_1000mv.img
+  fastboot reboot
+Rollback: flash the original vendor_boot.img.

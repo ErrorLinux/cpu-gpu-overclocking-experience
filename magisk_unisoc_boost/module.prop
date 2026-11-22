@@ -1,0 +1,6 @@
+id=unisoc_serenity_turbo_boost
+name=Unisoc Serenity Always Turbo Boost
+version=v1.0
+versionCode=100
+author=Hoang & Antigravity
+description=Enforces Unisoc UMS9230 (Redmi 14C / POCO C71 / Serenity) CPU Turbo Boost (2.21 GHz A75 + 1.82 GHz A55), eliminates thermal throttling, tunes schedutil governor, and locks max scaling frequency.
