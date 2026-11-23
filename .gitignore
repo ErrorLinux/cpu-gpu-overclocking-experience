@@ -1,0 +1,13 @@
+# Kernel build intermediates
+*.o
+*.mod.c
+*.usyms
+*.cmd
+Module.symvers
+modules.order
+*.bak
+
+# Local scratch / large source trees
+.work_*/
+kernel_source/
+dt_crcs.json

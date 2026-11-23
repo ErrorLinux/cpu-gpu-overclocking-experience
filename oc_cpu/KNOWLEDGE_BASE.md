@@ -360,3 +360,169 @@ Kịch bản `build_sml_dual_oc.py` tự động áp dụng 90 khối vá:
   - SHA-256: `9239e309603d74fcba857b01a433688ec9196869b37f4cbbbd3172a6e92c3ff4`
 - `sml_dual_definitive_stock_1820.img`: A75 @ 1.82 GHz (Stock) + A55 @ 1.82 GHz (Ch5)
   - SHA-256: `c15212af375510290cfe5f95fdd7a3b49a7cad20df8128f66c17de4963167863`
+
+---
+
+## 12. Đính chính bản chất SMC DVFS & bản thử set-index cứng (23/11/2026)
+
+### 12.1 Sai lầm trước đó
+Module `sprd_cpu_oc.c` gọi `0x82000605` như `freq_set`. Giải mã bảng dispatch
+SML tại payload `0x128B8` cho thấy index 5 → `0x5A14`, chính là
+`sprd_dvfs_pair_get` (log tag tại `0x11E08`). Hàm này CHỈ đọc bảng
+`freq/volt` (0x48F0/0x4808), không ghi phần cứng. Tương tự `0x606/0x607`
+rơi vào entry trống → trả 1, không phải freq_get/pair_get.
+
+### 12.2 Đường dẫn ghi thật
+Bảng dispatch `0xB00128B8` (byte offsets, base `0xB304`):
+
+| index | SMC | đích | hàm |
+|---|---|---|---|
+| 1 | 0x82000601 | 0xB30C → 0x5784 | `dvfs_cluster_enable` |
+| 2 | 0x82000602 | 0xB318 → 0x5878 | `dvfs_table_update` → `0x4DB8` → `0x4B7C` |
+| 3 | 0x82000603 | 0xB320 | đọc stack chưa init (vô dụng) |
+| 4 | 0x82000604 | 0xB334 | no-op |
+| 5 | 0x82000605 | 0xB35C → 0x5A14 | `pair_get` (a1=Hz, a2=uV) |
+
+`0x4B7C` = `dvfs_work_index_set`: validate cluster/index, đợi status phần
+cứng ổn định, gọi callback `[mgr+0x50]`, rồi RMW thanh ghi work-index qua
+`0x3A94`. **Đây là nơi duy nhất đổi xung thật.**
+
+### 12.3 Bảng OPP trong SML (payload)
+- A75 cluster 1 @ `0x174E8`: 10 mức, index **9 = 2,210,000 kHz / 1,050,000 uV**
+  (0=768M,1=1040M,2=1228.8M,3=1404M,4=1536M,5=1690M,6=1820M,7=1898M,
+  8=1950M,9=2210M).
+- A55 cluster 0 @ `0x17BB8`: 8 mức, index **7 = 1,898,000 / 1,040,000**
+  (index 6 = 1,820,000).
+
+### 12.4 Artifact mới
+- `new_tools/sprd_dvfs_hw.c/.ko` (16,368 B): module có param `oc_cluster`,
+  `oc_index`, `oc_probe`. Ghi `oc_index` = gọi SMC `0x82000602`.
+- `new_tools/vendor_boot_hw_smc.img`, SHA-256 `0c47dd20...b9`; module nằm ở
+  entry `sprd_cp_dump.ko`, `ntfs3.ko` bị zero để vừa khung DTB `0x20B9000`.
+- `new_tools/README-HW-SMC.md`, `oc_cpu/pmu_spot.sh` (đo PMU không đụng cpufreq).
+- **Lưu ý:** `pmu_verify.sh` đổi scaling_min/max → cpufreq gọi lại SML và ghi
+  đè index vừa đặt. Phải dùng `pmu_spot.sh` ngay sau khi ghi `oc_index`.
+
+### 12.5 Quyết định tiếp theo
+Nếu log `pair clu1 idx 9 = 2210000/1050000` nhưng PMU vẫn 1.82 GHz, chứng tỏ
+hàng MUX tương ứng index 9 trong bảng phần cứng vẫn chọn kênh 4 (Ch4/1.82G).
+Lúc đó chỉ vá đúng 1 dòng MUX của index 9 (không đoán như bản definitive).
+
+---
+
+## 13. Chốt nguyên nhân A75 kẹt 1.82 GHz & bản vá row6→Ch7 (23/11/2026)
+
+### 13.1 Thử nghiệm quyết định (ADB, module runtime v8 không gọi 0x60B)
+| SMC index | PMU A75 |
+|---|---|
+| 0 | 0.768 GHz |
+| 6 | 1.820 GHz |
+| 7 | 1.690 GHz |
+| 8 | 1.690 GHz |
+| 9 | 1.690 GHz |
+
+→ SMC `0x82000605(clu,index)` → `0x58FC` → `0x4B7C` **có ghi phần cứng thật**.
+Không phải clamp: index 7/8/9 bị rơi về kênh 3 (0x84=0x413≈1695 MHz) do
+**các row hardware 7-byte bị thiếu** trong bảng góc tương ứng.
+
+### 13.2 Cấu trúc row hardware
+Row dạng `03 00 <ch> <ch> 0a 04 05`, 7 byte, đánh số đúng bằng DVFS index:
+- index 6 = `03 00 04 04 0a 04 05` → Ch4 = 1820 MHz
+- index 7/8/9 cần Ch5/Ch6/Ch7; nhiều bảng để zeros → fallback Ch3 = 1690 MHz.
+
+Script cũ `build_sml_dual_definitive_oc.py` vá ở `t+7*7` với `t` lệch **0x10 byte**
+(do payload bắt đầu ở file offset `0x200`, không phải `0x210`) nên chưa từng đụng
+đúng row đang dùng.
+
+### 13.3 Bản vá mới
+`oc_cpu/sml_a75_ch7_row6.img` — SHA-256
+`d5601f2462ef3cf1343b0aff0b73820ba2d95670718530f0d0669e471a0a888e`
+Payload stock nguyên vẹn (hash `de88c8eb...`), shellcode vá 8 word lúc boot →
+chữ ký RSA giữ nguyên. Đổi row index 6 của cả 8 corner tables từ Ch4 → Ch7:
+`03 00 07 07 0a 04 05` (2210 MHz). Sau khi flash SML này, gọi `oc_index=6`
+(đã nằm trong clamp stock) → kỳ vọng PMU 2.21 GHz.
+
+### 13.4 Cảnh báo
+Không gọi SMC `0x8200060B` (dvfs_init) với `a2=0x280A`: nó làm A75 kẹt ở
+1.69 GHz cho mọi index. Bản v6/v7 có lỗi này; dùng module v8 (`sprd_dvfs_hw2.ko`,
+push qua ADB, không gọi 0x60B) để thử nghiệm.
+
+---
+
+## 14. Kết luận cuối cùng sau quét phần cứng (23/11/2026)
+
+### 14.1 Các thử nghiệm ADB (không flash)
+- SMC `0x82000605(clu1, idx)` → `0x58FC` → `0x4B7C`: index 0 cho PMU 0.768 GHz
+  → đường DVFS **có ghi phần cứng**. Tuy nhiên governor ép 1.82 nên mọi index
+  khác bị ghi đè; quét 0..15 đều ~1.82 GHz.
+- Ghi Ch4 `0x64580088 = 0x556` (PLL lock `0x2072a`, `0x94=0x556`): PMU vẫn 1.82 GHz
+  → **A75 không lấy xung trực tiếp từ Ch4**, khẳng định giả thuyết ban đầu.
+- Vá SML row6→Ch7, broad 32 row + OPP 1050 mV (shellcode, payload stock nguyên
+  vẹn): PMU không đổi → shellcode row patch không tác động clock path đang dùng.
+- Ghi `topdvfsctrl@64014000` 0x70/0x9c, `syscon@64000000` 0x280, `syscon@64020000`
+  0x624/0x62c/0x638 (các register đổi theo cpufreq): PMU không đổi → là status.
+- Quét ioremap `0x64300000..0x64300FFF`: **toàn bộ đọc ra 0** → khối APCPU secure
+  clock không expose cho normal world; MUX nằm ở đây hoặc sau firewall.
+- SMC service `0x82000100` (perf) chỉ echo ID; `0x82000500` là getter config,
+  không phải setter MUX.
+
+### 14.2 Kết luận
+Với quyền Linux + SMC DVFS + shellcode SML, **không thể đưa A75 quá 1.82 GHz**
+trên firmware này. Clock path thật nằm trong APCPU secure clock (`0x64300000`)
+hoặc DVFS hardware FSM mà SML điều khiển nội bộ; mọi nỗ lực từ normal world
+đều bị clamp/fallback về Ch4 (1.82 GHz). Ch7 (2.21 GHz) tồn tại trong PLL nhưng
+không được nối tới A75 bởi bất kỳ register nào có thể ghi từ Linux.
+
+### 14.3 Trạng thái máy khi kết thúc
+- SML: stock (`sml-sign.bin`).
+- vendor_boot: `vendor_boot_hw_smc_v7.img` (module v7 có lỗi gọi 0x60B nếu ghi
+  `oc_index`; không dùng). Có thể query `sprd_dvfs_hw2.ko` (v8, sạch) qua ADB.
+- CPU policy6 khôi phục 1820000/1820000, PMU A75 ≈ 1.82 GHz.
+
+### 14.4 Option 2 (đào SML callback) — kết quả
+- `0x4B7C` gọi callback `[mgr+0x50]` với (cluster,index) sau khi status OK;
+  manager = `[0xB0013180]` → runtime `0xB0013230`.
+- Không tìm thấy lệnh `str x?,[x?,#0x50]` hay `stp ...,[x?,#0x48]` nào gán
+  field này trong toàn payload 0x20240 → struct manager được khởi tạo từ
+  config/secure runtime, không phải hằng số trong ảnh.
+- Các callback ops table khác nằm tại `[mgr+0x40]` (xem `0x46F8`), được gọi
+  gián tiếp; không phải chỗ chọn nguồn MPLL cho A75.
+- Governor policy6 là `performance` và file `scaling_governor` **read-only**
+  (`-r--r--r--`); module `sprd_cpufreq_v2` là `[permanent]` không rmmod được
+  → mọi SMC index đều bị governor ghi đè về max 1.82 GHz trong các phép đo.
+
+→ Đã đào tới ranh giới có thể làm qua ADB/Linux user. Muốn đi tiếp cần
+  công cụ secure/JTAG hoặc sửa config bên trong SML đã ký (không chỉ shellcode).
+
+---
+
+## 15. Research trên mạng (23/11/2026)
+
+### 15.1 UnisocBypass (TheGammaSqueeze)
+- Repo: `github.com/TheGammaSqueeze/UnisocBypass`
+- BootROM chỉ check **DHTB SHA256** khi load SPL; SPL check RSA-2048 cho
+  SML/TrustOS/UBoot (4 call site). Có thể NOP verify call trong SPL + rehash
+  (`tools/patch_spl.py`, `tools/rehash.py`) → flash SML sửa payload trực tiếp.
+- Cơ chế shellcode `magic64` / patch table trong padding (giống script mình
+  đang dùng) là pathway được cộng đồng dùng cho UMS9620/T820.
+- DHTB: header 0x200, payload, SIMGHDR. BootROM bỏ qua RSA signature.
+
+### 15.2 OC research của chính repo đó (`oc/`)
+- Trên **UMS512/T618**, SML **KHÔNG có vai trò DVFS**; enforcement nằm ở DTB:
+  OPP tables + các bảng phụ thuộc `lit_core_cluster_tbl`,
+  `big_core_cluster_tbl`, `scu_cluster_tbl`, `periph_cluster_tbl`,
+  `gic_cluster_tbl`. Phải sửa tất cả cùng nhau.
+- Chọn bảng theo `cpu_bin` (efuse) → `operating-points-T618-<bin>`;
+  có debugfs `/sys/kernel/debug/sprd-cpufreq/cpu_bin` để đổi bin lúc chạy.
+- Voltage grade table nằm ở top DVFS ctrl `0xe4/0xe8`; GPU `core_indexN_map`
+  ở thanh ghi `0x48..0x64`; patch không giữ vì Mali `mali_clock_on` ghi lại.
+- Kết quả thật sau torture 600s: **CPU OC +0% throughput** (thermal saturation),
+  GPU 850→900 MHz chỉ **+1.57%**. Các con số +17% trước đó là artefact.
+
+### 15.3 Áp dụng cho máy mình
+- DTB `extracted.dts` **không có** `hardware-dvfs-platform`,
+  `big_core_cluster_tbl`, `operating-points-T7250-*` → kiến trúc UMS9230 khác:
+  bảng DVFS CPU nằm trong **SML**, không phải DTB. Không copy được công thức UMS512.
+- Có thể thử debugfs `cpu_bin` (khi máy nối lại ADB) để xem có bin table nào
+  khác không — nhưng khả năng thấp.
+- Kết luận từ cộng đồng: ngay cả khi OC được, lợi ích sustained ≈ 0 do thermal.
