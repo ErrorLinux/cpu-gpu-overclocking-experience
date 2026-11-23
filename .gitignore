@@ -1,13 +1,21 @@
 # Kernel build intermediates
 *.o
+*.mod
 *.mod.c
 *.usyms
 *.cmd
 Module.symvers
 modules.order
 *.bak
+__pycache__/
+*.pyc
 
 # Local scratch / large source trees
 .work_*/
 kernel_source/
 dt_crcs.json
+spdcRC.json
+
+# Experimental 100 MB vendor_boot variants (docs describe them; add with
+# `git add -f` if a specific build needs to be preserved in LFS)
+new_tools/vendor_boot_*.img
